@@ -37,11 +37,7 @@ A tutorial that walks through how to perform a damage assessment using a damage 
 
 ## DINOv3 + UPerNet segmentation model
 
-In addition to the `segmentation_models_pytorch` U-Net / DeepLabV3+ models, the
-trainer supports a DINOv3 ViT backbone with a UPerNet decode head (`model:
-upernet`). Trained checkpoints run through `inference.py` unchanged. See
-[DINOV3_UPERNET.md](DINOV3_UPERNET.md) for details and an xView2 (xBD) damage
-segmentation example.
+In addition to the `segmentation_models_pytorch` U-Net / DeepLabV3+ models, the trainer supports a DINOv3 ViT backbone with a UPerNet decode head (`model: upernet`). Run the three-class xView2 checkpoints on RGB GeoTIFFs with `inference_dinov3.py`. See [DINOV3_UPERNET.md](DINOV3_UPERNET.md) for inference commands and an xView2 (xBD) training example.
 
 
 ## Results
