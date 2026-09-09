@@ -9,30 +9,24 @@ and the first ``--val-fraction`` becomes ``val`` (the rest ``train``); the
 ``test/`` folder is ``test`` -- and writes a CSV of the number of **patches**
 (1024x1024 post-disaster image tiles) and **footprints** (building polygons in
 the post-disaster label JSONs) per disaster per split, plus a TOTAL row.
+With ``--include-tier3``, append all tier3 images to training only, using the
+shared manifest helper without changing original validation membership.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import glob
 import json
 import os
-import random
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from bda.xview2 import (
+    build_manifest, disaster as _disaster, split_paths, validate_manifest, write_json,
+)
 
 SPLITS = ["train", "val", "test"]
-
-
-def _post_images(root: str, folder: str) -> list[str]:
-    fns = sorted(glob.glob(os.path.join(root, folder, "images", "*_post_disaster.png")))
-    if not fns:
-        raise SystemExit(f"No post-disaster images under {root}/{folder}/images/.")
-    return fns
-
-
-def _disaster(image_fn: str) -> str:
-    # e.g. ".../hurricane-harvey_00000123_post_disaster.png" -> "hurricane-harvey"
-    return os.path.basename(image_fn).split("_")[0]
 
 
 def _num_footprints(image_fn: str) -> int:
@@ -40,7 +34,8 @@ def _num_footprints(image_fn: str) -> int:
     label_fn = os.path.join(
         folder, "labels", os.path.basename(image_fn).replace(".png", ".json")
     )
-    feats = json.load(open(label_fn))["features"]["xy"]
+    with open(label_fn) as stream:
+        feats = json.load(stream)["features"]["xy"]
     return sum(1 for f in feats if f.get("properties", {}).get("feature_type") == "building")
 
 
@@ -50,16 +45,22 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--val-fraction", type=float, default=0.1)
     p.add_argument("--output", default="scripts/xview2_split_sizes.csv")
+    p.add_argument("--include-tier3", action="store_true",
+                   help="Append all tier3 to training, preserving original validation.")
+    p.add_argument("--manifest-output", help="Also write the reproducible split manifest.")
+    p.add_argument("--validate", action="store_true",
+                   help="Sequentially validate every RGB PNG and target before reporting.")
     args = p.parse_args()
 
-    train_fns = _post_images(args.xview2_root, "train")
-    random.Random(args.seed).shuffle(train_fns)
-    n_val = int(len(train_fns) * args.val_fraction)
-    split_fns = {
-        "val": train_fns[:n_val],
-        "train": train_fns[n_val:],
-        "test": _post_images(args.xview2_root, "test"),
-    }
+    manifest = build_manifest(
+        args.xview2_root, args.include_tier3, args.seed, args.val_fraction,
+    )
+    if args.validate:
+        report = validate_manifest(args.xview2_root, manifest)
+        print(json.dumps(report, indent=2))
+    if args.manifest_output:
+        write_json(args.manifest_output, manifest)
+    split_fns = split_paths(args.xview2_root, manifest)
 
     # disaster -> split -> (patches, footprints)
     patches: dict[str, dict[str, int]] = {}

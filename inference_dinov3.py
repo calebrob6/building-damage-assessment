@@ -11,6 +11,9 @@ training grouping: any damage, major damage or worse, or destroyed only.
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from itertools import islice, product
 import math
 from pathlib import Path
@@ -18,7 +21,7 @@ import tempfile
 
 import numpy as np
 import rasterio
-from rasterio.enums import ColorInterp
+from rasterio.enums import ColorInterp, MaskFlags
 from rasterio.windows import Window
 import torch
 from tqdm import tqdm
@@ -58,14 +61,71 @@ def _reflect_indices(start: int, size: int, limit: int) -> np.ndarray:
 
 def read_patch(src, y: int, x: int, patch_size: int, padding: int):
     """Read an overlapping patch, reflecting context beyond the image edges."""
+    top, left = y - padding, x - padding
+    masked = not all(MaskFlags.all_valid in flags for flags in src.mask_flag_enums)
+    if top >= 0 and left >= 0 and top + patch_size <= src.height and left + patch_size <= src.width:
+        image = src.read(window=Window(left, top, patch_size, patch_size), masked=masked)
+        if not masked:
+            return image, np.ones((patch_size, patch_size), dtype=bool)
+        return image.filled(0), ~np.ma.getmaskarray(image).any(axis=0)
     rows = _reflect_indices(y - padding, patch_size, src.height)
     cols = _reflect_indices(x - padding, patch_size, src.width)
     y0, x0 = int(rows.min()), int(cols.min())
     y1, x1 = int(rows.max()) + 1, int(cols.max()) + 1
-    image = src.read(window=Window(x0, y0, x1 - x0, y1 - y0), masked=True)
+    image = src.read(window=Window(x0, y0, x1 - x0, y1 - y0), masked=masked)
     image = image[:, rows[:, None] - y0, cols[None, :] - x0]
+    if not masked:
+        return image, np.ones((patch_size, patch_size), dtype=bool)
     valid = ~np.ma.getmaskarray(image).any(axis=0)
     return image.filled(0), valid
+
+
+@contextmanager
+def patch_batches(
+    input_fn, coordinates, batch_size, patch_size, padding, device,
+    num_workers=0, prefetch_factor=2,
+):
+    """Prepare bounded, ordered batches without sharing raster handles across threads."""
+    def prepare(src, batch_coordinates):
+        patches = [read_patch(src, y, x, patch_size, padding) for y, x in batch_coordinates]
+        images = np.stack([image for image, _ in patches]).astype(np.float32)
+        images -= IMAGENET_MEAN[None, :, None, None]
+        images /= IMAGENET_STD[None, :, None, None]
+        # The original reflected-index reader produced channels-last batches.
+        images = torch.from_numpy(images).contiguous(memory_format=torch.channels_last)
+        if device.type == "cuda" and num_workers:
+            with torch.cuda.device(device):
+                images = images.pin_memory()
+        return images, [valid for _, valid in patches], batch_coordinates
+
+    def read_batch(batch_coordinates):
+        # GDAL environments must be opened and closed in the same thread.
+        with rasterio.open(input_fn) as src:
+            return prepare(src, batch_coordinates)
+
+    def chunks():
+        while batch := list(islice(coordinates, batch_size)):
+            yield batch
+
+    def prefetched(executor):
+        batches = chunks()
+        pending = deque(
+            executor.submit(read_batch, batch)
+            for batch in islice(batches, num_workers * prefetch_factor)
+        )
+        while pending:
+            batch = pending.popleft().result()
+            following = next(batches, None)
+            if following is not None:
+                pending.append(executor.submit(read_batch, following))
+            yield batch
+
+    if num_workers:
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            yield prefetched(executor)
+    else:
+        with rasterio.open(input_fn) as src:
+            yield (prepare(src, batch) for batch in chunks())
 
 
 @torch.inference_mode()
@@ -78,6 +138,8 @@ def run_inference(
     padding: int = 64,
     batch_size: int = 8,
     overwrite: bool = False,
+    num_workers: int = 2,
+    prefetch_factor: int = 2,
 ) -> None:
     """Stream predictions to a GeoTIFF on the source grid with bounded memory."""
     if patch_size < 32 or patch_size % 16:
@@ -86,6 +148,8 @@ def run_inference(
         raise ValueError("padding must be nonnegative and less than half patch_size")
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
+    if num_workers < 0 or prefetch_factor < 1:
+        raise ValueError("num_workers must be nonnegative and prefetch_factor must be positive")
     if output_fn.resolve() in (input_fn.resolve(), checkpoint_fn.resolve()):
         raise ValueError("Output must not overwrite the input image or checkpoint")
     if output_fn.exists() and not overwrite:
@@ -142,16 +206,14 @@ def run_inference(
                     CLASS_2="damaged",
                     NORMALIZATION="ImageNet mean/std on 8-bit RGB; no clipping",
                 )
-                with tqdm(total=num_patches, unit="patch") as progress:
-                    while batch_coordinates := list(islice(coordinates, batch_size)):
-                        patches = [
-                            read_patch(src, y, x, patch_size, padding)
-                            for y, x in batch_coordinates
-                        ]
-                        images = np.stack([image for image, _ in patches]).astype(np.float32)
-                        images -= IMAGENET_MEAN[None, :, None, None]
-                        images /= IMAGENET_STD[None, :, None, None]
-                        inputs = torch.from_numpy(images).to(target_device)
+                with patch_batches(
+                    input_fn, coordinates, batch_size, patch_size, padding,
+                    target_device, num_workers, prefetch_factor,
+                ) as batches, tqdm(total=num_patches, unit="patch") as progress:
+                    for images, valid_masks, batch_coordinates in batches:
+                        inputs = images.to(
+                            target_device, non_blocking=target_device.type == "cuda" and num_workers > 0,
+                        )
                         with torch.autocast(
                             device_type=target_device.type,
                             dtype=torch.float16,
@@ -161,8 +223,8 @@ def run_inference(
                         if not torch.isfinite(logits).all().item():
                             raise RuntimeError("Model produced non-finite predictions")
                         predictions = logits.argmax(1).to(torch.uint8).cpu().numpy()
-                        for prediction, (_, valid), (y, x) in zip(
-                            predictions, patches, batch_coordinates
+                        for prediction, valid, (y, x) in zip(
+                            predictions, valid_masks, batch_coordinates
                         ):
                             h, w = min(stride, src.height - y), min(stride, src.width - x)
                             core = np.s_[padding : padding + h, padding : padding + w]
@@ -184,12 +246,15 @@ def main() -> None:
     parser.add_argument("--patch-size", type=int, default=512, help="Patch size (default: 512)")
     parser.add_argument("--padding", type=int, default=64, help="Discarded context per side (default: 64)")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size (default: 8)")
+    parser.add_argument("--num-workers", type=int, default=2, help="Prefetch reader threads (default: 2)")
+    parser.add_argument("--prefetch-factor", type=int, default=2, help="Prepared batches per reader (default: 2)")
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing output")
     args = parser.parse_args()
     run_inference(
         args.input, args.checkpoint, args.output, device=args.device,
         patch_size=args.patch_size, padding=args.padding,
         batch_size=args.batch_size, overwrite=args.overwrite,
+        num_workers=args.num_workers, prefetch_factor=args.prefetch_factor,
     )
 
 

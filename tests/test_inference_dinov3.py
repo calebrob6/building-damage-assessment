@@ -45,6 +45,7 @@ class InferenceTests(unittest.TestCase):
                 valid = np.full_like(labels, 255)
                 valid[0, 0] = 0
                 valid[-1, -1] = 0
+                valid[height // 2, width // 2] = 0
                 dst.write_mask(valid)
                 labels[valid == 0] = 255
         return labels
@@ -78,6 +79,47 @@ class InferenceTests(unittest.TestCase):
                 with rasterio.open(self.output) as src:
                     np.testing.assert_array_equal(src.read(1), expected)
 
+    def test_prefetched_batches_match_serial(self):
+        for shape in ((47, 73), (1, 1), (1, 37)):
+            for workers in (0, 1, 3):
+                with self.subTest(shape=shape, workers=workers):
+                    expected = self.write_input(*shape, masked=True)
+                    self.run_model(padding=8, num_workers=workers, overwrite=True)
+                    with rasterio.open(self.output) as src:
+                        np.testing.assert_array_equal(src.read(1), expected)
+
+    def test_normalized_batches_match_serial(self):
+        self.write_input(47, 73, masked=True)
+        outputs = []
+        for workers in (0, 3):
+            coordinates = iter([(0, 0), (16, 32), (32, 64)])
+            with inference.patch_batches(
+                self.input, coordinates, 2, 32, 8, torch.device("cpu"),
+                num_workers=workers, prefetch_factor=1,
+            ) as batches:
+                outputs.append(list(batches))
+        for serial, parallel in zip(*outputs):
+            torch.testing.assert_close(serial[0], parallel[0], rtol=0, atol=0)
+            np.testing.assert_array_equal(serial[1], parallel[1])
+            self.assertEqual(serial[2], parallel[2])
+
+    def test_prefetch_does_not_read_the_whole_raster(self):
+        self.write_input()
+        reads = []
+        original_read = inference.read_patch
+
+        def tracked_read(*args):
+            reads.append(1)
+            return original_read(*args)
+
+        with patch.object(inference, "read_patch", side_effect=tracked_read):
+            with inference.patch_batches(
+                self.input, iter([(0, 0)] * 100), 2, 32, 8, torch.device("cpu"),
+                num_workers=2, prefetch_factor=1,
+            ) as batches:
+                next(batches)
+        self.assertLessEqual(len(reads), 6)
+
     def test_read_patch_matches_whole_image_reflection(self):
         self.write_input()
         with rasterio.open(self.input) as src:
@@ -105,7 +147,8 @@ class InferenceTests(unittest.TestCase):
     def test_invalid_options_and_imagery(self):
         for options in (
             {"patch_size": 16}, {"patch_size": 33}, {"padding": -1},
-            {"padding": 256}, {"batch_size": 0},
+            {"padding": 256}, {"batch_size": 0}, {"num_workers": -1},
+            {"prefetch_factor": 0},
         ):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 inference.run_inference(
@@ -133,6 +176,26 @@ class InferenceTests(unittest.TestCase):
         torch.save({"hyper_parameters": {"model": "unet"}}, self.checkpoint)
         with self.assertRaisesRegex(ValueError, "UPerNet checkpoint"):
             inference.load_model(self.checkpoint, torch.device("cpu"))
+
+    def test_reader_failure_cleans_up_handles_and_output(self):
+        self.write_input()
+        self.output.write_bytes(b"existing")
+        opened = []
+        original_open = rasterio.open
+
+        def tracked_open(*args, **kwargs):
+            src = original_open(*args, **kwargs)
+            opened.append(src)
+            return src
+
+        with patch.object(inference.rasterio, "open", side_effect=tracked_open):
+            with patch.object(inference, "read_patch", side_effect=RuntimeError("read failed")):
+                with self.assertRaisesRegex(RuntimeError, "read failed"):
+                    self.run_model(padding=8, num_workers=2, overwrite=True)
+        self.assertTrue(opened)
+        self.assertTrue(all(src.closed for src in opened))
+        self.assertEqual(self.output.read_bytes(), b"existing")
+        self.assertEqual(list(self.root.glob(".dinov3-*")), [])
 
 
 if __name__ == "__main__":
